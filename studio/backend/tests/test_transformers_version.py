@@ -3,9 +3,12 @@
 
 """Tests for transformers version detection with local checkpoint fallbacks."""
 
+import contextlib
 import json
 import logging
 import os
+import ssl
+import types
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -67,11 +70,10 @@ from utils.transformers_version import (
 
 @pytest.fixture(autouse = True)
 def _no_ambient_proxy(monkeypatch):
-    """Module-wide: these tests patch urlopen, which a selected proxy opener bypasses.
+    """Module-wide: keep ambient proxy settings out of the reads this file does not stub.
 
-    Every remote read here goes through ``_hf_urlopen``, which calls ``opener.open`` when
-    a proxy applies. A runner with HTTPS_PROXY / ALL_PROXY set would then make a real
-    request instead of hitting the patch, so results would track ambient CI connectivity.
+    The reachability probe still goes out, so a runner with HTTPS_PROXY / ALL_PROXY set
+    would make its results track ambient CI connectivity.
     """
     for key in (
         "HTTP_PROXY",
@@ -109,6 +111,76 @@ def _capturable_logger(monkeypatch):
 # ---------------------------------------------------------------------------
 # _resolve_base_model — config.json fallback
 # ---------------------------------------------------------------------------
+
+
+import utils.transformers_version as tv_mod  # noqa: E402
+
+
+class _FakeHubResponse:
+    def __init__(
+        self,
+        payload,
+        status_code = 200,
+    ):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _HarnessError(BaseException):
+    """A fault in the fake itself, not in the code under test.
+
+    Derived from BaseException so the production code's broad ``except Exception`` cannot
+    absorb it and leave the test passing on a read that should never have happened.
+    """
+
+
+class _FakeHubSession:
+    """Stands in for the pooled Hub session, recording what was asked for.
+
+    ``responder`` is a response, an exception to raise, or a callable taking
+    ``(url, headers)``. Omit it to assert that nothing is fetched.
+    """
+
+    def __init__(self, responder = None):
+        self._responder = responder
+        self.urls = []
+        self.auth = []
+        self.auth_objects = []
+        self.timeouts = []
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        # Named, so a request argument the production code stops passing -- or starts --
+        # shows up here rather than being absorbed.
+        if set(kwargs) != {"headers", "timeout", "auth"}:
+            raise _HarnessError(f"unexpected request arguments: {sorted(kwargs)}")
+        headers, timeout, auth = kwargs["headers"], kwargs["timeout"], kwargs["auth"]
+        self.timeouts.append(timeout)
+        self.auth_objects.append(auth)
+        # Mirror how requests applies an auth callable, so the token the production code
+        # actually sends is what these tests observe.
+        applied = dict(headers or {})
+        if auth is not None:
+            request = types.SimpleNamespace(headers = applied)
+            auth(request)
+            applied = request.headers
+        self.auth.append(applied.get("Authorization"))
+        if self._responder is None:
+            raise _HarnessError(f"unexpected Hub read: {url}")
+        result = self._responder(url, applied) if callable(self._responder) else self._responder
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+@contextlib.contextmanager
+def _hub_returning(responder = None):
+    session = _FakeHubSession(responder)
+    with patch("utils.transformers_version._hub_session", return_value = session):
+        yield session
 
 
 class TestResolveBaseModel:
@@ -201,24 +273,10 @@ class TestRemoteLoraBase:
             ),
         )
 
-    @staticmethod
-    def _resp(cfg: dict):
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self):
-                return json.dumps(cfg).encode()
-
-        return _Resp()
-
     def test_fetches_base_from_remote_adapter_config(self, monkeypatch):
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         cfg = {"base_model_name_or_path": "nvidia/NVIDIA-Nemotron-3-Nano-4B"}
-        with patch("urllib.request.urlopen", return_value = self._resp(cfg)):
+        with _hub_returning(_FakeHubResponse(cfg)):
             assert (
                 _remote_lora_base("someuser/my-nemotron-lora") == "nvidia/NVIDIA-Nemotron-3-Nano-4B"
             )
@@ -231,15 +289,11 @@ class TestRemoteLoraBase:
         # Enterprise mirror: the fetch must target HF_ENDPOINT, not hardcoded huggingface.co.
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         monkeypatch.setenv("HF_ENDPOINT", "https://hf.mirror.internal")
-        seen = {}
-
-        def fake_urlopen(req, timeout = 10):
-            seen["url"] = req.full_url
-            return self._resp({"base_model_name_or_path": "org/base"})
-
-        with patch("urllib.request.urlopen", side_effect = fake_urlopen):
+        with _hub_returning(_FakeHubResponse({"base_model_name_or_path": "org/base"})) as hub:
             assert _remote_lora_base("user/adapter") == "org/base"
-        assert seen["url"].startswith("https://hf.mirror.internal/user/adapter/resolve/main/")
+        assert hub.urls == [
+            "https://hf.mirror.internal/user/adapter/resolve/main/adapter_config.json"
+        ]
 
     @staticmethod
     def _seed_adapter_cache(
@@ -259,28 +313,28 @@ class TestRemoteLoraBase:
         self._seed_adapter_cache(tmp_path, "user/cached-lora", "nvidia/Nemotron-H-8B")
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-        with patch("urllib.request.urlopen") as mock_url:
+        with _hub_returning() as hub:
             assert _remote_lora_base("user/cached-lora") == "nvidia/Nemotron-H-8B"
-            mock_url.assert_not_called()  # offline: cache only, no network
+            assert hub.urls == []  # offline: cache only, no network
 
     def test_fetch_failure_falls_back_to_cache(self, tmp_path: Path, monkeypatch):
         self._seed_adapter_cache(tmp_path, "user/cached-lora", "nvidia/Nemotron-H-8B")
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-        with patch("urllib.request.urlopen", side_effect = OSError("boom")):
+        with _hub_returning(OSError("boom")):
             assert _remote_lora_base("user/cached-lora") == "nvidia/Nemotron-H-8B"
 
     def test_offline_uncached_makes_no_request(self, tmp_path: Path, monkeypatch):
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-        with patch("urllib.request.urlopen") as mock_url:
+        with _hub_returning() as hub:
             assert _remote_lora_base("org/adapter") is None
-            mock_url.assert_not_called()
+            assert hub.urls == []
 
     def test_non_adapter_repo_returns_none(self, tmp_path: Path, monkeypatch):
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-        with patch("urllib.request.urlopen", side_effect = OSError("boom")):
+        with _hub_returning(OSError("boom")):
             assert _remote_lora_base("org/not-an-adapter") is None
 
     def test_existing_relative_path_not_treated_as_repo(self, monkeypatch):
@@ -288,30 +342,32 @@ class TestRemoteLoraBase:
         # a Hub repo: no request, no risk of matching an unrelated remote/cached adapter.
         import utils.paths as paths
         monkeypatch.setattr(paths, "is_local_path", lambda p: True)
-        with patch("urllib.request.urlopen") as mock_url:
+        with _hub_returning() as hub:
             assert _remote_lora_base("outputs/run1") is None
-            mock_url.assert_not_called()
+            assert hub.urls == []
 
     def test_404_returns_none_not_stale_cache(self, tmp_path: Path, monkeypatch):
-        import urllib.error
-
         # The repo is now a full model (adapter_config.json 404s) but a stale LoRA snapshot is
         # cached: a definitive 404 must return None, not the stale base.
         self._seed_adapter_cache(tmp_path, "user/was-a-lora", "old/base")
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-        err = urllib.error.HTTPError("url", 404, "Not Found", {}, None)
-        with patch("urllib.request.urlopen", side_effect = err):
+        denial = _FakeHubResponse({"base_model_name_or_path": "wrong/base"}, 404)
+        with _hub_returning(denial):
             assert _remote_lora_base("user/was-a-lora") is None
 
-    def test_transient_http_error_falls_back_to_cache(self, tmp_path: Path, monkeypatch):
-        import urllib.error
+    def test_a_non_200_success_is_still_a_body(self, monkeypatch):
+        """urllib returned the body for any 2xx; a mirror may answer 203."""
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
+        with _hub_returning(_FakeHubResponse({"base_model_name_or_path": "org/base"}, 203)):
+            assert _remote_lora_base("user/adapter") == "org/base"
 
+    def test_transient_http_error_falls_back_to_cache(self, tmp_path: Path, monkeypatch):
         self._seed_adapter_cache(tmp_path, "user/cached-lora", "nvidia/Nemotron-H-8B")
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-        err = urllib.error.HTTPError("url", 503, "Service Unavailable", {}, None)
-        with patch("urllib.request.urlopen", side_effect = err):
+        denial = _FakeHubResponse({"base_model_name_or_path": "wrong/base"}, status_code = 503)
+        with _hub_returning(denial):
             assert _remote_lora_base("user/cached-lora") == "nvidia/Nemotron-H-8B"
 
 
@@ -347,9 +403,9 @@ class TestCheckTokenizerConfigNeedsV5:
         tc = {"tokenizer_class": "LlamaTokenizerFast"}
         (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
+        with _hub_returning() as hub:
             result = _check_tokenizer_config_needs_v5(str(tmp_path))
-            mock_urlopen.assert_not_called()
+            assert hub.urls == []
         assert result is False
 
     def test_result_is_cached(self, tmp_path: Path):
@@ -368,32 +424,16 @@ class TestCheckTokenizerConfigNeedsV5:
         import utils.transformers_version as tv
 
         monkeypatch.setattr(tv, "_env_offline", lambda: False)
-        seen_auth = []
 
-        class _Resp:
-            def __init__(self, body):
-                self._b = body
-
-            def read(self):
-                return self._b.encode()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        def fake_urlopen(req, timeout = 10):
-            auth = req.get_header("Authorization")
-            seen_auth.append(auth)
-            if auth:
-                return _Resp(json.dumps({"tokenizer_class": "TokenizersBackend"}))
+        def _gated(url, headers):
+            if headers.get("Authorization"):
+                return _FakeHubResponse({"tokenizer_class": "TokenizersBackend"})
             raise OSError("HTTP 401")
 
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-        assert _check_tokenizer_config_needs_v5("org/gated") is False  # unauth miss
-        assert _check_tokenizer_config_needs_v5("org/gated", "tok") is True  # authed hit
-        assert seen_auth == [None, "Bearer tok"]
+        with _hub_returning(_gated) as hub:
+            assert _check_tokenizer_config_needs_v5("org/gated") is False  # unauth miss
+            assert _check_tokenizer_config_needs_v5("org/gated", "tok") is True  # authed hit
+        assert hub.auth == [None, "Bearer tok"]
         assert _tokenizer_class_cache[("org/gated", None)] is False  # miss not poisoning
 
     def test_remote_fetch_respects_hf_endpoint(self, monkeypatch):
@@ -401,27 +441,12 @@ class TestCheckTokenizerConfigNeedsV5:
 
         monkeypatch.setattr(tv, "_env_offline", lambda: False)
         monkeypatch.setenv("HF_ENDPOINT", "https://hf.mirror.internal/")
-        seen = {}
-
-        class _Resp:
-            def read(self):
-                return json.dumps({"tokenizer_class": "TokenizersBackend"}).encode()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        def fake_urlopen(req, timeout = 10):
-            seen["url"] = req.full_url
-            return _Resp()
-
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-        assert _check_tokenizer_config_needs_v5("org/model") is True
-        assert seen["url"] == (
+        with _hub_returning(_FakeHubResponse({"tokenizer_class": "TokenizersBackend"})) as hub:
+            assert _check_tokenizer_config_needs_v5("org/model") is True
+        assert hub.urls == [
             "https://hf.mirror.internal/org/model/resolve/main/tokenizer_config.json"
-        )
+        ]
+        assert hub.timeouts == [10], "the read must stay bounded"
 
 
 # ---------------------------------------------------------------------------
@@ -503,8 +528,7 @@ class TestCheckConfigNeeds550:
     def test_no_config_json(self, tmp_path: Path):
         """Missing config.json should return False (fail-open)."""
         # Patch network call to avoid a real fetch.
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_urlopen.side_effect = Exception("no network")
+        with _hub_returning(OSError("no network")):
             assert _check_config_needs_550(str(tmp_path)) is False
 
     def test_result_is_cached(self, tmp_path: Path):
@@ -522,9 +546,9 @@ class TestCheckConfigNeeds550:
         cfg = {"architectures": ["LlamaForCausalLM"]}
         (tmp_path / "config.json").write_text(json.dumps(cfg))
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
+        with _hub_returning() as hub:
             _check_config_needs_550(str(tmp_path))
-            mock_urlopen.assert_not_called()
+            assert hub.urls == []
 
 
 # ---------------------------------------------------------------------------
@@ -603,8 +627,7 @@ class TestCheckConfigNeeds510:
     def test_no_config_json(self, tmp_path: Path):
         """Missing config.json should return False (fail-open)."""
         # Patch network call to avoid real fetch
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_urlopen.side_effect = Exception("no network")
+        with _hub_returning(OSError("no network")):
             assert _check_config_needs_510(str(tmp_path)) is False
 
     def test_result_is_cached(self, tmp_path: Path):
@@ -622,9 +645,9 @@ class TestCheckConfigNeeds510:
         cfg = {"architectures": ["LlamaForCausalLM"]}
         (tmp_path / "config.json").write_text(json.dumps(cfg))
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
+        with _hub_returning() as hub:
             _check_config_needs_510(str(tmp_path))
-            mock_urlopen.assert_not_called()
+            assert hub.urls == []
 
 
 # ---------------------------------------------------------------------------
@@ -694,22 +717,6 @@ class TestNemotronHNeedsMlpSupport:
         assert _nemotron_h_needs_mlp_support({"model_type": "wrapper", "llm_config": None}) is False
 
 
-def _hf_response(cfg: dict):
-    """A urlopen() context-manager stand-in returning *cfg* as JSON bytes."""
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return json.dumps(cfg).encode()
-
-    return _Resp()
-
-
 class TestConfigJsonHfCacheFallback:
     """HF hub cache is consulted only offline or after a failed fetch (never stale online)."""
 
@@ -753,9 +760,9 @@ class TestConfigJsonHfCacheFallback:
         self._seed_cache(tmp_path, "unsloth/NVIDIA-Nemotron-3-Nano-4B", cfg)
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-        with patch("urllib.request.urlopen") as mock_url:
+        with _hub_returning() as hub:
             assert _load_config_json("unsloth/NVIDIA-Nemotron-3-Nano-4B") == cfg
-            mock_url.assert_not_called()
+            assert hub.urls == []
 
     def test_online_prefers_network_over_cache(self, tmp_path: Path, monkeypatch):
         stale = {"model_type": "nemotron_h", "hybrid_override_pattern": "MMMM"}
@@ -764,37 +771,31 @@ class TestConfigJsonHfCacheFallback:
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
-        with patch("urllib.request.urlopen", return_value = _hf_response(fresh)):
+        with _hub_returning(_FakeHubResponse(fresh)):
             assert _load_config_json("org/model") == fresh  # network wins, not stale cache
 
     def test_remote_fetch_respects_hf_endpoint(self, monkeypatch):
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
         monkeypatch.setenv("HF_ENDPOINT", "https://hf.mirror.internal/")
-        seen = {}
-
-        def fake_urlopen(req, timeout = 10):
-            seen["url"] = req.full_url
-            return _hf_response({"model_type": "llama"})
-
-        with patch("urllib.request.urlopen", side_effect = fake_urlopen):
+        with _hub_returning(_FakeHubResponse({"model_type": "llama"})) as hub:
             assert _load_config_json("org/model") == {"model_type": "llama"}
-        assert seen["url"] == "https://hf.mirror.internal/org/model/resolve/main/config.json"
+        assert hub.urls == ["https://hf.mirror.internal/org/model/resolve/main/config.json"]
 
     def test_network_failure_falls_back_to_cache(self, tmp_path: Path, monkeypatch):
         cfg = {"model_type": "nemotron_h", "hybrid_override_pattern": "M-M*-"}
         self._seed_cache(tmp_path, "org/model", cfg)
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-        with patch("urllib.request.urlopen", side_effect = OSError("boom")):
+        with _hub_returning(OSError("boom")):
             assert _load_config_json("org/model") == cfg
 
     def test_offline_uncached_returns_none(self, tmp_path: Path, monkeypatch):
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-        with patch("urllib.request.urlopen") as mock_url:
+        with _hub_returning() as hub:
             assert _load_config_json("private/unknown") is None
-            mock_url.assert_not_called()
+            assert hub.urls == []
 
     def test_helper_ignores_local_paths(self, tmp_path: Path):
         # A filesystem path is not a repo id; never treat it as one.
@@ -823,15 +824,13 @@ class TestConfigJsonHfCacheFallback:
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         # Network fails -> serve the cached snapshot, but it must not be memoized.
-        with patch("urllib.request.urlopen", side_effect = OSError("boom")):
+        with _hub_returning(OSError("boom")):
             assert _load_config_json("org/model") == stale
         # Connectivity returns: the next call must hit the network for the fresh config.
-        with patch("urllib.request.urlopen", return_value = _hf_response(fresh)):
+        with _hub_returning(_FakeHubResponse(fresh)):
             assert _load_config_json("org/model") == fresh
 
     def test_auth_failure_does_not_serve_cache(self, tmp_path: Path, monkeypatch):
-        import urllib.error
-
         # config.json cached from an earlier authorized session; an unauthenticated 4xx
         # must not be handed that private metadata.
         cfg = {"model_type": "nemotron_h", "hybrid_override_pattern": "M-M*-"}
@@ -840,20 +839,18 @@ class TestConfigJsonHfCacheFallback:
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         for code in (401, 403, 404):
             _config_json_cache.clear()
-            err = urllib.error.HTTPError("url", code, "denied", {}, None)
-            with patch("urllib.request.urlopen", side_effect = err):
+            # The denial carries a body: returning it would be as wrong as serving the cache.
+            denied = _FakeHubResponse({"model_type": "leaked"}, status_code = code)
+            with _hub_returning(denied):
                 assert _load_config_json("private/model") is None
 
     def test_server_error_still_falls_back_to_cache(self, tmp_path: Path, monkeypatch):
-        import urllib.error
-
         cfg = {"model_type": "nemotron_h", "hybrid_override_pattern": "M-M*-"}
         self._seed_cache(tmp_path, "org/model", cfg)
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         # A 5xx is transient, not an access decision: keep serving the cache.
-        err = urllib.error.HTTPError("url", 503, "busy", {}, None)
-        with patch("urllib.request.urlopen", side_effect = err):
+        with _hub_returning(_FakeHubResponse({"model_type": "wrong"}, 503)):
             assert _load_config_json("org/model") == cfg
 
 
@@ -886,11 +883,11 @@ class TestTierCheckTransientRetry:
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         # Network blip -> serve the cache, but do NOT pin the tier result.
-        with patch("urllib.request.urlopen", side_effect = OSError("boom")):
+        with _hub_returning(OSError("boom")):
             assert _check_config_needs_510("org/model") is False
         assert ("org/model", None) not in _config_needs_510_cache
         # Connectivity returns: the next call re-fetches and sees the higher tier.
-        with patch("urllib.request.urlopen", return_value = _hf_response(fresh)):
+        with _hub_returning(_FakeHubResponse(fresh)):
             assert _check_config_needs_510("org/model") is True
         assert _config_needs_510_cache[("org/model", None)] is True  # definitive read memoized
 
@@ -898,10 +895,10 @@ class TestTierCheckTransientRetry:
         fresh = {"architectures": ["Gemma4ForConditionalGeneration"]}  # needs 550
         monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
-        with patch("urllib.request.urlopen", return_value = _hf_response(fresh)) as mock_url:
+        with _hub_returning(_FakeHubResponse(fresh)) as hub:
             assert _check_config_needs_550("org/model") is True
             assert _check_config_needs_550("org/model") is True
-            assert mock_url.call_count == 1  # second call served from the tier cache
+            assert len(hub.urls) == 1  # second call served from the tier cache
 
 
 class TestHigherTier:
@@ -980,30 +977,19 @@ class TestGetTransformersTier:
             json.dumps({"tokenizer_class": "TokenizersBackend"})
         )
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
+        with _hub_returning() as hub:
             assert get_transformers_tier(str(tmp_path)) == "510"
-            mock_urlopen.assert_not_called()
+            assert hub.urls == []
 
     def test_dense_nemotron_h_remote_config_returns_510(self):
         """Remote dense NemotronH (HF id) → 510 via config.json fetch, not 530."""
 
-        class _Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "model_type": "nemotron_h",
-                        "hybrid_override_pattern": "M-M-M*-M-",
-                    }
-                ).encode()
-
-        with patch("urllib.request.urlopen", return_value = _Response()):
+        config = _FakeHubResponse(
+            {"model_type": "nemotron_h", "hybrid_override_pattern": "M-M-M*-M-"}
+        )
+        with _hub_returning(config) as hub:
             assert get_transformers_tier("unsloth/NVIDIA-Nemotron-3-Nano-4B") == "510"
+        assert hub.urls, "the tier must come from the scripted config, not the live Hub"
 
     def test_local_config_json_short_circuits_path_substrings(self, tmp_path: Path):
         """Local config.json should prevent false matches from parent directory names."""
@@ -1021,32 +1007,20 @@ class TestGetTransformersTier:
             json.dumps({"tokenizer_class": "LlamaTokenizerFast"})
         )
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
+        with _hub_returning() as hub:
             assert get_transformers_tier(str(model_dir)) == "default"
-            mock_urlopen.assert_not_called()
+            assert hub.urls == []
 
     def test_remote_config_json_is_fetched_once_for_config_tiers(self):
         """510 and 550 slow-path checks should share one config.json fetch."""
 
-        class _Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "architectures": ["Gemma4ForConditionalGeneration"],
-                        "model_type": "gemma4",
-                    }
-                ).encode()
-
-        with patch("urllib.request.urlopen", return_value = _Response()) as mock_urlopen:
+        config = _FakeHubResponse(
+            {"architectures": ["Gemma4ForConditionalGeneration"], "model_type": "gemma4"}
+        )
+        with _hub_returning(config) as hub:
             assert get_transformers_tier("org/no-fast-substring-model") == "550"
 
-        assert mock_urlopen.call_count == 1
+        assert len(hub.urls) == 1
 
     def test_qwen35_returns_530(self):
         with (
@@ -1587,28 +1561,28 @@ class TestLocalCheckpointFilesAppear:
     def test_tokenizer_config_appearing_later_is_read(self, tmp_path: Path, monkeypatch):
         local = str(tmp_path)
 
-        def boom(*a, **k):
-            raise AssertionError("a local checkpoint must not be fetched from the Hub")
-
-        monkeypatch.setattr("urllib.request.urlopen", boom)
+        session = _FakeHubSession(_FakeHubResponse({"tokenizer_class": "TokenizersBackend"}))
+        monkeypatch.setattr(tv_mod, "_hub_session", lambda: session)
         # Before the file exists: not 5.x, no network, and the miss must not be pinned.
         assert _check_tokenizer_config_needs_v5(local) is False
+        assert session.urls == [], "a local checkpoint must not be fetched from the Hub"
         # The file appears with a 5.x-only tokenizer -> the next call must read it.
         (tmp_path / "tokenizer_config.json").write_text(
             json.dumps({"tokenizer_class": "TokenizersBackend"})
         )
         assert _check_tokenizer_config_needs_v5(local) is True
+        assert session.urls == []
 
     def test_config_json_appearing_later_is_read(self, tmp_path: Path, monkeypatch):
         local = str(tmp_path)
 
-        def boom(*a, **k):
-            raise AssertionError("a local checkpoint must not be fetched from the Hub")
-
-        monkeypatch.setattr("urllib.request.urlopen", boom)
+        session = _FakeHubSession(_FakeHubResponse({"model_type": "llama"}))
+        monkeypatch.setattr(tv_mod, "_hub_session", lambda: session)
         assert _load_config_json(local) is None
+        assert session.urls == [], "a local checkpoint must not be fetched from the Hub"
         (tmp_path / "config.json").write_text(json.dumps({"model_type": "gemma4"}))
         assert _load_config_json(local) == {"model_type": "gemma4"}
+        assert session.urls == []
 
 
 # ---------------------------------------------------------------------------
@@ -2778,18 +2752,8 @@ class TestOfflineCacheNotPoisoned:
         # 2) Back online: the real fetch runs (cache was not poisoned) and is honored.
         monkeypatch.setattr(tv, "_env_offline", lambda: False)
 
-        class _Resp:
-            def read(self):
-                return json.dumps({"tokenizer_class": "TokenizersBackend"}).encode()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout = 10: _Resp())
-        assert _check_tokenizer_config_needs_v5("org/needs5") is True
+        with _hub_returning(_FakeHubResponse({"tokenizer_class": "TokenizersBackend"})):
+            assert _check_tokenizer_config_needs_v5("org/needs5") is True
 
     def test_offline_config_miss_not_cached(self, monkeypatch):
         import utils.transformers_version as tv
@@ -3956,3 +3920,253 @@ class TestDamagedLatestSidecarRepairHandoff:
             tv._probe_tier("some/model", None, "test", include_default = True, floor = "default")
             != "latest"
         )
+
+
+class TestHubSessionPooling:
+    """The reads above share a connection instead of handshaking per file."""
+
+    def test_reads_in_one_thread_share_a_session(self):
+        assert tv_mod._hub_session() is tv_mod._hub_session()
+
+    def test_each_thread_gets_its_own_session(self):
+        """requests.Session is not guaranteed thread-safe, so sharing one would be a bug."""
+        import threading
+
+        mine, theirs = tv_mod._hub_session(), {}
+        thread = threading.Thread(target = lambda: theirs.setdefault("s", tv_mod._hub_session()))
+        thread.start()
+        thread.join()
+        assert theirs["s"] is not mine
+
+
+@contextlib.contextmanager
+def _rebuilt_hub_session():
+    """A session built from the current environment, discarded afterwards."""
+
+    def discard():
+        if hasattr(tv_mod._hub_http, "session"):
+            del tv_mod._hub_http.session
+
+    discard()
+    try:
+        yield tv_mod._hub_session()
+    finally:
+        discard()
+
+
+def _a_single_certificate(tmp_path: Path) -> Path:
+    """A bundle holding exactly one certificate, so an exclusive store is countable."""
+    import certifi
+
+    one = Path(certifi.where()).read_text().split("-----END CERTIFICATE-----")[0]
+    bundle = tmp_path / "internal.pem"
+    bundle.write_text(one + "-----END CERTIFICATE-----\n")
+    return bundle
+
+
+class TestHubSessionTrust:
+    """The session keeps what urllib honoured, minus the credential source it did not."""
+
+    @staticmethod
+    def _hop(session, url, came_from):
+        """A prepared request for *url*, and the response that redirected to it."""
+        import requests
+
+        request = session.prepare_request(
+            requests.Request("GET", url, auth = tv_mod._BearerOnly("tok"))
+        )
+        response = requests.Response()
+        response.request = requests.Request("GET", came_from).prepare()
+        return request, response
+
+    def test_the_read_supplies_an_auth_object_at_all(self, monkeypatch):
+        """Its presence is what suppresses .netrc; passing none would re-open that."""
+        monkeypatch.setattr(tv_mod, "_env_offline", lambda: False)
+        with _hub_returning(_FakeHubResponse({"model_type": "llama"})) as hub:
+            _load_config_json("org/model")
+        assert isinstance(hub.auth_objects[0], tv_mod._BearerOnly)
+
+    def test_netrc_never_replaces_the_token(self, monkeypatch):
+        """requests consults it when preparing *and* at every redirect hop; these reads
+        authenticate with the token they were given or not at all."""
+        import requests.sessions
+
+        monkeypatch.setattr(
+            requests.sessions, "get_netrc_auth", lambda url, raise_errors = False: ("u", "p")
+        )
+        with _rebuilt_hub_session() as session:
+            request, response = self._hop(
+                session, "https://huggingface.co/a", "https://huggingface.co/a"
+            )
+            assert request.headers["Authorization"] == "Bearer tok"
+            session.rebuild_auth(request, response)
+            assert request.headers["Authorization"] == "Bearer tok"
+
+    def test_a_redirect_to_another_host_drops_the_token(self, monkeypatch):
+        with _rebuilt_hub_session() as session:
+            request, response = self._hop(
+                session, "https://cdn.example/x", "https://huggingface.co/a"
+            )
+            session.rebuild_auth(request, response)
+            assert "Authorization" not in request.headers
+
+    def test_the_environment_still_decides_the_proxy(self, monkeypatch):
+        """Re-derived here twice before, and wrong both times; requests does it."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+        monkeypatch.setenv("NO_PROXY", "internal.example")
+        with _rebuilt_hub_session() as session:
+
+            def proxies(url):
+                return session.merge_environment_settings(url, {}, None, None, None)["proxies"]
+
+            assert proxies("https://huggingface.co/a")["https"] == "http://proxy.internal:3128"
+            assert "https" not in proxies("https://internal.example/b")
+
+    def test_a_configured_bundle_replaces_the_trust_store(self, tmp_path, monkeypatch):
+        """A deployment pinned to an internal CA must not also trust the public roots."""
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(_a_single_certificate(tmp_path)))
+        with _rebuilt_hub_session() as session:
+            adapter = session.get_adapter("https://huggingface.co/x")
+            assert (
+                adapter.poolmanager.connection_pool_kw["ssl_context"].cert_store_stats()["x509"]
+                == 1
+            )
+
+            # requests would hand urllib3 certifi to load alongside it.
+            conn = types.SimpleNamespace(ca_certs = "certifi", ca_cert_dir = "somewhere")
+            adapter.cert_verify(conn, "https://huggingface.co/x", True, None)
+            assert (conn.ca_certs, conn.ca_cert_dir, conn.cert_reqs) == (
+                None,
+                None,
+                "CERT_REQUIRED",
+            )
+
+    def test_both_the_direct_and_proxied_paths_verify_against_the_openssl_defaults(self):
+        """requests alone verifies against certifi, and gives the proxy its own manager."""
+        with _rebuilt_hub_session() as session:
+            adapter = session.get_adapter("https://huggingface.co/x")
+            context = adapter.poolmanager.connection_pool_kw.get("ssl_context")
+            assert isinstance(context, ssl.SSLContext)
+            # An SSL_CERT_FILE/SSL_CERT_DIR pair is expressible only through a context.
+            assert context.cert_store_stats()["x509"] > 0
+
+            # An http:// origin gets the same adapter: it can still be reached over TLS
+            # to a proxy, and that hop must use the configured store.
+            assert session.get_adapter("http://mirror.internal/x") is adapter
+
+            proxied = session.get_adapter("https://huggingface.co/x").proxy_manager_for(
+                "http://proxy.internal:3128"
+            )
+            assert isinstance(proxied.connection_pool_kw.get("ssl_context"), ssl.SSLContext)
+
+    def test_an_https_proxy_hop_is_verified_against_the_same_store(self, tmp_path, monkeypatch):
+        """urllib3 verifies the hop to the proxy against a context of its own."""
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(_a_single_certificate(tmp_path)))
+        with _rebuilt_hub_session() as session:
+            proxied = session.get_adapter("https://huggingface.co/x").proxy_manager_for(
+                "https://proxy.internal:8443"
+            )
+            context = getattr(proxied, "proxy_ssl_context", None)
+            assert isinstance(context, ssl.SSLContext)
+            # The configured store, not whatever the defaults happen to trust.
+            assert context.cert_store_stats()["x509"] == 1
+
+    def test_only_an_http_proxy_manager_is_given_a_proxy_context(self, monkeypatch):
+        """urllib3's SOCKS manager takes no such argument and rejects the pool key."""
+        from requests.adapters import HTTPAdapter
+        from urllib3.poolmanager import PoolKey
+
+        assert not any("proxy_ssl_context" in field for field in PoolKey._fields)
+
+        seen = {}
+        monkeypatch.setattr(
+            HTTPAdapter,
+            "proxy_manager_for",
+            lambda self, proxy, **kwargs: seen.update(kwargs) or object(),
+        )
+        with _rebuilt_hub_session() as session:
+            adapter = session.get_adapter("https://huggingface.co/x")
+
+            adapter.proxy_manager_for("socks5h://proxy.internal:1080")
+            assert "proxy_ssl_context" not in seen
+
+            seen.clear()
+            adapter.proxy_manager_for("https://proxy.internal:8443")
+            assert "proxy_ssl_context" in seen
+
+    def test_a_changed_ca_environment_rebuilds_the_session(self, tmp_path, monkeypatch):
+        """The trust store is fixed when the pool is created; urllib rebuilt it per read."""
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising = False)
+        with _rebuilt_hub_session() as first:
+            assert tv_mod._hub_session() is first
+
+            monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "rotated.pem"))
+            assert tv_mod._hub_session() is not first
+
+    def test_an_http_origin_does_not_force_cert_none_onto_the_context(self, monkeypatch):
+        """requests derives cert_reqs from the URL; the TLS hop may be to a proxy."""
+        with _rebuilt_hub_session() as session:
+            adapter = session.get_adapter("http://mirror.internal/x")
+            conn = types.SimpleNamespace(ca_certs = "certifi", ca_cert_dir = "somewhere")
+            adapter.cert_verify(conn, "http://mirror.internal/x", True, None)
+            assert conn.cert_reqs == "CERT_REQUIRED"
+
+    def test_a_deliberately_unverified_context_stays_unverified(self, monkeypatch):
+        """A process that replaces the hook means it; urllib honoured that."""
+        import ssl as ssl_mod
+
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising = False)
+        monkeypatch.delenv("CURL_CA_BUNDLE", raising = False)
+        monkeypatch.setattr(
+            ssl_mod, "_create_default_https_context", ssl_mod._create_unverified_context
+        )
+        with _rebuilt_hub_session() as session:
+            adapter = session.get_adapter("https://mirror.internal/x")
+            conn = types.SimpleNamespace(ca_certs = None, ca_cert_dir = None)
+            adapter.cert_verify(conn, "https://mirror.internal/x", True, None)
+            # Forcing CERT_REQUIRED here leaves a context with no roots at all.
+            assert conn.cert_reqs == "CERT_NONE"
+
+    def test_restoring_the_hook_restores_verification(self, monkeypatch):
+        """The snapshot must not outlive the pools it was taken for."""
+        import ssl as ssl_mod
+
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising = False)
+        monkeypatch.delenv("CURL_CA_BUNDLE", raising = False)
+        monkeypatch.setattr(
+            ssl_mod, "_create_default_https_context", ssl_mod._create_unverified_context
+        )
+        with _rebuilt_hub_session() as unverified_session:
+            monkeypatch.setattr(
+                ssl_mod, "_create_default_https_context", ssl_mod.create_default_context
+            )
+            session = tv_mod._hub_session()
+            assert session is not unverified_session
+
+            adapter = session.get_adapter("https://mirror.internal/x")
+            conn = types.SimpleNamespace(ca_certs = None, ca_cert_dir = None)
+            adapter.cert_verify(conn, "https://mirror.internal/x", True, None)
+            assert conn.cert_reqs == "CERT_REQUIRED"
+
+    def test_the_context_comes_from_the_hook_urllib_builds_its_own_from(self, monkeypatch):
+        """So a process that customises TLS globally still reaches these reads."""
+        customised = ssl.create_default_context()
+        monkeypatch.setattr(ssl, "_create_default_https_context", lambda: customised)
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising = False)
+        monkeypatch.delenv("CURL_CA_BUNDLE", raising = False)
+        with _rebuilt_hub_session() as session:
+            adapter = session.get_adapter("https://huggingface.co/x")
+            assert adapter.poolmanager.connection_pool_kw["ssl_context"] is customised
+
+
+class TestHubSessionCarriesNoCookies:
+    def test_the_session_stores_and_returns_no_cookies(self):
+        """urllib had no jar; one read must not carry a cookie into the next."""
+        import requests
+        from requests.cookies import MockRequest
+
+        request = MockRequest(requests.Request("GET", "https://huggingface.co/x").prepare())
+        # The comparison is what makes the assertion below non-vacuous.
+        assert requests.Session().cookies.get_policy().domain_return_ok("huggingface.co", request)
+        policy = tv_mod._hub_session().cookies.get_policy()
+        assert policy.domain_return_ok("huggingface.co", request) is False

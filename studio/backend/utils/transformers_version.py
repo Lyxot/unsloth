@@ -29,6 +29,7 @@ Strategy:
 """
 
 import ast
+import http.cookiejar
 import importlib
 import importlib.util
 import json
@@ -58,7 +59,7 @@ _OFFLINE_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def _env_offline() -> bool:
-    """True if an HF offline env var is truthy; gates the urllib fetches below.
+    """True if an HF offline env var is truthy; gates the Hub fetches below.
 
     An open force_hf_offline window counts too: during a spawn the guard briefly restores
     the user's values into os.environ, and an env-only check would then send the very
@@ -117,14 +118,174 @@ def _hf_proxy_opener(url: str):
     return None
 
 
-def _hf_urlopen(req, timeout: int):
-    """``urlopen`` through the same proxy huggingface_hub would use for this request."""
-    import urllib.request
+_hub_http = threading.local()
+_HUB_READ_TIMEOUT = 10  # seconds; a metadata read must not stall a load
 
-    opener = _hf_proxy_opener(req.full_url)
-    if opener is not None:
-        return opener.open(req, timeout = timeout)
-    return urllib.request.urlopen(req, timeout = timeout)
+
+class _BearerOnly:
+    """Applies the Bearer token, and suppresses any other credential source.
+
+    Being present at all is what suppresses them: requests consults ``.netrc`` only when
+    no auth object is set.
+    """
+
+    def __init__(self, token: str | None):
+        self._token = token
+
+    def __call__(self, request):
+        if self._token:
+            request.headers["Authorization"] = f"Bearer {self._token}"
+        return request
+
+
+def _hub_session():
+    """A pooled HTTP session for the raw Hub metadata reads below, one per thread.
+
+    Resolving one model reads several metadata files, and a fresh TLS handshake for each
+    dominated that path. Per thread because ``requests.Session`` is not guaranteed
+    thread-safe. Not the Hub client's own: these reads run before the transformers sidecar
+    is on ``sys.path``, and importing huggingface_hub here would bind the default copy.
+
+    Rebuilt when the CA environment changes, because the trust store is fixed when the
+    connection pool is created and urllib rebuilt its context for every read.
+    """
+    trust = _ca_environment()
+    session = getattr(_hub_http, "session", None)
+    if session is not None and getattr(_hub_http, "trust", None) != trust:
+        session.close()
+        session = None
+    if session is None:
+        session = _hub_session_class()()
+        # No jar, as urllib had none: a cookie picked up by one read would otherwise ride
+        # along on the next, which may carry a different token or none.
+        session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains = []))
+        adapter = _openssl_default_adapter()
+        session.mount("https://", adapter)
+        # http:// too: the origin may be plain, and still be reached over TLS to a proxy.
+        session.mount("http://", adapter)
+        _hub_http.session = session
+        _hub_http.trust = trust
+    return session
+
+
+def _ca_environment() -> tuple:
+    """Everything that decides the trust store, so a change to any of it is noticed.
+
+    The hook belongs here as much as the variables: a process that swaps it is changing
+    what verification means, and the adapter reads it once when its pools are built.
+    """
+    import ssl
+    return tuple(
+        os.environ.get(name)
+        for name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR")
+    ) + (getattr(ssl, "_create_default_https_context", None),)
+
+
+def _hub_session_class():
+    """``requests.Session``, minus its ``.netrc`` lookups.
+
+    Everything else ``trust_env`` governs -- the proxy for each URL, the CA variables --
+    is wanted. The credential source is not: requests would replace an explicitly supplied
+    Bearer token with Basic credentials for anyone who has a Hub entry in ``.netrc``, on
+    the first request and again at every redirect hop.
+    """
+    import requests
+
+    class _HubSession(requests.Session):
+        def rebuild_auth(self, prepared_request, response):
+            # As requests does, minus the netrc lookup: a redirect to another host drops
+            # the token rather than handing it to whatever the mirror redirected to.
+            headers = prepared_request.headers
+            if "Authorization" in headers and self.should_strip_auth(
+                response.request.url, prepared_request.url
+            ):
+                del headers["Authorization"]
+
+    return _HubSession
+
+
+def _openssl_default_adapter():
+    """A transport adapter verifying against the context urllib would have built.
+
+    requests verifies against certifi and consults neither ``SSL_CERT_FILE`` nor
+    ``SSL_CERT_DIR``; ``verify`` names a single path, so it cannot express both anyway.
+    Each of these names a trust store that *replaces* the default one, so whatever requests
+    would load alongside the context is discarded: a deployment pinned to an internal CA
+    must not also trust the public roots.
+    """
+    import ssl
+
+    from requests.adapters import HTTPAdapter
+
+    def build():
+        bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+        if bundle:
+            if _safe_is_dir(Path(bundle)):
+                return ssl.create_default_context(capath = bundle)
+            return ssl.create_default_context(cafile = bundle)
+        # Otherwise what urllib's HTTPS handler builds its context from, which honours
+        # SSL_CERT_FILE and SSL_CERT_DIR and any process-wide customisation.
+        return getattr(ssl, "_create_default_https_context", ssl.create_default_context)()
+
+    # A process that replaces the hook with ``_create_unverified_context`` means it, and
+    # reached self-signed mirrors that way through urllib. Read once, with the pools it
+    # matches: _ca_environment carries the hook, so a swap rebuilds the whole session.
+    unverified = build().verify_mode == ssl.CERT_NONE
+
+    class _OpenSSLDefaultAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            kwargs["ssl_context"] = build()
+            return super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, proxy, **kwargs):
+            kwargs["ssl_context"] = build()
+            # urllib3 verifies the hop to an https:// proxy against a separate context.
+            # Its SOCKS manager takes no such argument and would reject the pool key.
+            if not proxy.lower().startswith("socks"):
+                kwargs["proxy_ssl_context"] = build()
+            return super().proxy_manager_for(proxy, **kwargs)
+
+        def cert_verify(self, conn, url, verify, cert):
+            super().cert_verify(conn, url, verify, cert)
+            # The context decides, and the connection follows it. requests derives
+            # cert_reqs from the request URL, which urllib3 then applies to whichever
+            # context it was handed -- but an http:// origin can still be reached over TLS
+            # to a proxy, and the context may be a deliberately unverified one.
+            conn.cert_reqs = "CERT_NONE" if unverified else "CERT_REQUIRED"
+            # The context already holds everything that should be trusted; urllib3 would
+            # load these on top of it and widen that set.
+            conn.ca_certs = None
+            conn.ca_cert_dir = None
+
+    return _OpenSSLDefaultAdapter()
+
+
+class HubMetadataStatus(Exception):
+    """A non-OK status from a raw Hub metadata read; ``code`` separates a definitive
+    answer (private repo, absent file) from a transient failure worth falling back on."""
+
+    def __init__(self, code: int):
+        super().__init__(f"HTTP {code}")
+        self.code = code
+
+
+def _hf_read_json(model_name: str, filename: str, hf_token: str | None):
+    """*filename* for *model_name*, parsed, from the Hub's raw endpoint.
+
+    A redirect to another host drops the Authorization header rather than forwarding it
+    as urllib did; an authenticated mirror that redirects off-host reads as unauthorized
+    instead of handing the token to whatever it redirected to.
+    """
+    url = _hf_raw_url(model_name, filename)
+    response = _hub_session().get(
+        url,
+        headers = {"User-Agent": "unsloth-studio"},
+        auth = _BearerOnly(hf_token),
+        timeout = _HUB_READ_TIMEOUT,
+    )
+    if not 200 <= response.status_code < 300:
+        raise HubMetadataStatus(response.status_code)
+    return response.json()
 
 
 def hf_endpoint_unreachable(
@@ -722,22 +883,13 @@ def _remote_lora_base(model_name: str, hf_token: str | None = None) -> str | Non
     if _env_offline():
         return _adapter_base_from_hf_cache(model_name)
 
-    import urllib.error
-    import urllib.request
-
-    url = _hf_raw_url(model_name, "adapter_config.json")
-    headers = {"User-Agent": "unsloth-studio"}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
     try:
-        req = urllib.request.Request(url, headers = headers)
-        with _hf_urlopen(req, timeout = 10) as resp:
-            cfg = json.loads(resp.read().decode())
+        cfg = _hf_read_json(model_name, "adapter_config.json", hf_token)
         base = cfg.get("base_model_name_or_path")
         if base:
             logger.info("Resolved remote LoRA adapter '%s' → base model '%s'", model_name, base)
         return base or None
-    except urllib.error.HTTPError as exc:
+    except HubMetadataStatus as exc:
         if exc.code == 404:
             return None  # definitively not a LoRA; do not serve a stale cached base
         logger.debug("adapter_config.json fetch failed for '%s': %s", model_name, exc)
@@ -789,16 +941,8 @@ def _check_tokenizer_config_needs_v5(model_name: str, hf_token: str | None = Non
         return False
 
     # --- Fall back to fetching from HuggingFace ---
-    import urllib.request
-
-    url = _hf_raw_url(model_name, "tokenizer_config.json")
-    headers = {"User-Agent": "unsloth-studio"}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
     try:
-        req = urllib.request.Request(url, headers = headers)
-        with _hf_urlopen(req, timeout = 10) as resp:
-            data = json.loads(resp.read().decode())
+        data = _hf_read_json(model_name, "tokenizer_config.json", hf_token)
         tokenizer_class = data.get("tokenizer_class", "")
         result = tokenizer_class in _TRANSFORMERS_5_TOKENIZER_CLASSES
         if result:
@@ -897,20 +1041,11 @@ def _load_config_json(model_name: str, hf_token: str | None = None) -> dict | No
             _config_json_cache[cache_key] = cfg
         return cfg
 
-    import urllib.error
-    import urllib.request
-
-    url = _hf_raw_url(model_name, "config.json")
-    headers = {"User-Agent": "unsloth-studio"}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
     try:
-        req = urllib.request.Request(url, headers = headers)
-        with _hf_urlopen(req, timeout = 10) as resp:
-            cfg = json.loads(resp.read().decode())
+        cfg = _hf_read_json(model_name, "config.json", hf_token)
         _config_json_cache[cache_key] = cfg
         return cfg
-    except urllib.error.HTTPError as exc:
+    except HubMetadataStatus as exc:
         # 401/403/404 is definitive: never serve another caller's cached private metadata.
         if exc.code in (401, 403, 404):
             logger.debug("config.json access denied for '%s': %s", model_name, exc)
