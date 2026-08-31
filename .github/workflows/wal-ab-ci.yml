@@ -9,6 +9,8 @@ name: WAL keeper A/B
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ci/9934-wal-ab]
 
 permissions:
   contents: read
