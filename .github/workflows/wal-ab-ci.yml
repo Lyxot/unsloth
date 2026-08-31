@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Deterministic A/B for #9934 on the platform that reported it. The negative control runs
+# the identical script with the keeper left closed, which is exactly the pre-fix path, so a
+# green fixed leg only means something next to a red-shaped control leg.
+
+name: WAL keeper A/B
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      # The script imports only the storage layer, which reaches one third-party module.
+      - run: pip install structlog
+      - name: Fixed
+        working-directory: studio/backend
+        run: python ../../.github/scripts/wal_ab/wal_ab.py --keeper --json-out ../../fixed.json
+      - name: Baseline (negative control)
+        working-directory: studio/backend
+        run: python ../../.github/scripts/wal_ab/wal_ab.py --json-out ../../baseline.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-ab-${{ matrix.os }}
+          path: |
+            fixed.json
+            baseline.json
