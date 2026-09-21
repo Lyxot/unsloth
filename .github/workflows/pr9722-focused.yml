@@ -1,0 +1,58 @@
+name: PR 9722 focused CI
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pr9722-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  frontend:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Focused regression tests
+        timeout-minutes: 3
+        run: node --experimental-strip-types --test tests/mlx-bnb-load-progress.test.ts tests/chat-cache-miss-download-label.test.ts tests/download-progress-reconcile.test.ts
+      - name: Execute actual polling behavior
+        run: node ../../.github/pr9722-progress-probe.mjs
+      - name: Typecheck and build
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        run: npm run build
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Install backend dependencies
+        run: |
+          python -m pip install uv
+          uv pip install --system -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart aiofiles sqlalchemy psutil pyyaml pillow
+      - name: MLX substitution and worker regression tests
+        timeout-minutes: 3
+        run: python -m pytest studio/backend/tests/test_mlx_bnb_substitution.py -q -rs --timeout=60
