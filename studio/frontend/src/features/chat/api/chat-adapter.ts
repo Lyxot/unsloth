@@ -319,6 +319,7 @@ import {
   generationIsSettled,
   releaseLiveGenerationRun,
   requestParsesThinkTags,
+  usageCacheWriteTokens,
 } from "../utils/chat-generation-recovery";
 import {
   generateAudio,
@@ -396,9 +397,11 @@ interface ServerUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  // External prompt-cache fields (external_provider.py); cache_creation is Anthropic-only.
+  // External prompt-cache fields (external_provider.py); cache_creation is Anthropic-only,
+  // cache_write_tokens is OpenRouter's.
   prompt_tokens_details?: {
     cached_tokens?: number;
+    cache_write_tokens?: number;
   };
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
@@ -6370,9 +6373,6 @@ export function createOpenAIStreamAdapter(
                     ...(sandboxAttachments.length > 0
                       ? { sandbox_attachments: sandboxAttachments }
                       : {}),
-                    ...(resolvedThreadId
-                      ? { thread_id: resolvedThreadId }
-                      : {}),
                     ...(ragEnabled || projectRagEnabled
                       ? {
                           rag_scope: {
@@ -6442,6 +6442,8 @@ export function createOpenAIStreamAdapter(
                 : {}),
               provider_base_url: externalProvider.baseUrl || null,
               provider_api_type: externalProvider.apiType ?? "chat_completions",
+              // On every external request: it pins the thread's prompt date and OpenRouter's cache routing.
+              ...(resolvedThreadId ? { thread_id: resolvedThreadId } : {}),
               ...(openaiCodeExecContainerId
                 ? {
                     openai_code_exec_container_id: openaiCodeExecContainerId,
@@ -8015,8 +8017,7 @@ export function createOpenAIStreamAdapter(
           meta?.usage?.prompt_tokens_details?.cached_tokens ??
           meta?.usage?.cache_read_input_tokens ??
           0;
-        // Anthropic-only (billed at the write premium).
-        const cacheWriteTokens = meta?.usage?.cache_creation_input_tokens ?? 0;
+        const cacheWriteTokens = usageCacheWriteTokens(meta?.usage);
 
         // Gate on the captured checkpoint and thread so a late completion from provider A cannot
         // repaint the bar after a switch to B. A first turn is adopted onto an id mid-run, so read
