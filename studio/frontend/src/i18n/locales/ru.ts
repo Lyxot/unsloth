@@ -583,6 +583,10 @@ export const ru = {
   chatMenu: {
     more: "Параметры чата",
     copy: "Копировать",
+    compact: "Сжать беседу",
+    compactQueued: "Запрошено сжатие для следующего сообщения",
+    compactEmpty: "Пока нечего сжимать",
+    compactUnsupported: "Для сжатия нужна модель GGUF или MLX с поддержкой инструментов",
   },
   picker: {
     onDevice: "На устройстве",

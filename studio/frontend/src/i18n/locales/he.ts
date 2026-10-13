@@ -658,6 +658,10 @@ export const he = {
   chatMenu: {
     more: "אפשרויות צ'אט",
     copy: "העתקה",
+    compact: "כווץ שיחה",
+    compactQueued: "התבקש כיווץ שיחה עבור ההודעה הבאה",
+    compactEmpty: "אין עדיין מה לכווץ",
+    compactUnsupported: "דחיסת שיחה דורשת מודל GGUF או MLX עם תמיכה בכלים",
   },
   picker: {
     onDevice: "במכשיר",

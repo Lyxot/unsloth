@@ -673,6 +673,10 @@ export const sv = {
   chatMenu: {
     more: "Chattalternativ",
     copy: "Kopiera",
+    compact: "Komprimera konversationen",
+    compactQueued: "Komprimering begärd för nästa meddelande",
+    compactEmpty: "Inget att komprimera än",
+    compactUnsupported: "Komprimering kräver en GGUF- eller MLX-modell med verktygsstöd",
   },
   picker: {
     onDevice: "På enheten",

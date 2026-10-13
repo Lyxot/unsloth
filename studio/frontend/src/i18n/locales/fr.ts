@@ -583,6 +583,10 @@ export const fr = {
   chatMenu: {
     more: "Options de la discussion",
     copy: "Copier",
+    compact: "Compacter la conversation",
+    compactQueued: "Compactage demandé pour le prochain message",
+    compactEmpty: "Rien à compacter pour le moment",
+    compactUnsupported: "Le compactage nécessite un modèle GGUF ou MLX prenant en charge les outils",
   },
   picker: {
     onDevice: "Sur l'appareil",

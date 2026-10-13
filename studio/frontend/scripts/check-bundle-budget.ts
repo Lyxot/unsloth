@@ -60,8 +60,10 @@ export const BUDGET = {
   // transfer, code that shares the eager chat row menu module); the Library card and composer tweaks
   // and the edit_file download link add the rest, 0.2 to 1.7 KB transfer each. Raised by that growth
   // so main's margin stays where it was.
-  transferBytes: 2_013_000,
-  rawBytes: 6_703_000,
+  // The compact menu adds 1,570 bytes raw / 535 bytes transfer against 38f560814e on one machine/build,
+  // with the same 98 eager chunks. Raised by that growth to preserve the base's margin.
+  transferBytes: 2_013_535,
+  rawBytes: 6_704_570,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
