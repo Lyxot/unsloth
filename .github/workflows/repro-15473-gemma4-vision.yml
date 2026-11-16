@@ -69,7 +69,8 @@ jobs:
             sleep $((5 * attempt))
           done
           # mlx-vlm 0.7.9 declares a newer transformers, but Desktop runs it on 5.5.0: pin both without the resolver.
-          pip install --no-deps 'mlx==0.32.4' 'mlx-vlm==0.7.9' 'mlx-lm==0.32.2' 'transformers==5.5.0'
+          pip install --no-deps 'mlx==0.32.4' 'mlx-vlm==0.7.9' 'mlx-lm==0.32.2' 'transformers==5.5.0' 'tokenizers==0.22.2'
+          python -c "import mlx_lm, mlx_vlm, transformers; print('imports ok')"
           pip list | grep -iE '^(mlx|transformers|unsloth)'
 
       - name: Download model
