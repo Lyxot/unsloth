@@ -68,7 +68,8 @@ jobs:
             [ "$attempt" -eq 3 ] && exit 1
             sleep $((5 * attempt))
           done
-          pip install 'mlx==0.32.4' 'mlx-vlm==0.7.9' 'mlx-lm==0.32.2' 'transformers==5.5.0'
+          # mlx-vlm 0.7.9 declares a newer transformers, but Desktop runs it on 5.5.0: pin both without the resolver.
+          pip install --no-deps 'mlx==0.32.4' 'mlx-vlm==0.7.9' 'mlx-lm==0.32.2' 'transformers==5.5.0'
           pip list | grep -iE '^(mlx|transformers|unsloth)'
 
       - name: Download model
