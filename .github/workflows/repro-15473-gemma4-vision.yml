@@ -1,0 +1,108 @@
+name: repro-15473-gemma4-vision
+
+# Reproduce unslothai/unsloth#15473 on GitHub-hosted Apple Silicon (M1-class) runners:
+# Gemma 4 answering an image prompt with <unused6226> when MLX runs it in float16.
+on:
+  push:
+    branches: [repro/15473-gemma4-e4b-m1]
+    paths:
+      - .github/workflows/repro-15473-gemma4-vision.yml
+      - .github/repro/gemma4_vision_nan.py
+  workflow_dispatch:
+    inputs:
+      model:
+        description: MLX checkpoint
+        default: mlx-community/gemma-4-e4b-it-4bit
+      zoo_ref:
+        description: unsloth-zoo git ref
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: ${{ matrix.os }} / ${{ matrix.case }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        case: [base-fp16, base-auto, lora-fp16]
+        include:
+          - case: base-fp16
+            dtype: float16
+            train_steps: 0
+          - case: base-auto
+            dtype: auto
+            train_steps: 0
+          - case: lora-fp16
+            dtype: float16
+            train_steps: 20
+    env:
+      MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e4b-it-4bit' }}
+      ZOO_REF: ${{ inputs.zoo_ref || 'main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Machine
+        run: |
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n hw.memsize | awk '{print $1/1073741824 " GB"}'
+          sw_vers
+          df -h . | tail -1
+
+      # Same MLX stack the reporters' Unsloth Desktop runs (see the issue thread).
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          for attempt in 1 2 3; do
+            pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@${ZOO_REF}" && break
+            [ "$attempt" -eq 3 ] && exit 1
+            sleep $((5 * attempt))
+          done
+          pip install 'mlx==0.32.4' 'mlx-vlm==0.7.9' 'mlx-lm==0.32.2' 'transformers==5.5.0'
+          pip list | grep -iE '^(mlx|transformers|unsloth)'
+
+      - name: Download model
+        run: python -c "from huggingface_hub import snapshot_download; print(snapshot_download('${MODEL}'))"
+
+      - name: Reproduce
+        run: |
+          set -o pipefail
+          python -u .github/repro/gemma4_vision_nan.py \
+            --model "$MODEL" --dtype "${{ matrix.dtype }}" \
+            --train-steps "${{ matrix.train_steps }}" --report report.json 2>&1 | tee repro.log
+
+      - name: Summary
+        if: always()
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          if not os.path.exists("report.json"):
+              print("no report (script failed before writing it)"); raise SystemExit
+          d = json.load(open("report.json"))
+          print(f"### ${{ matrix.os }} / ${{ matrix.case }}: reproduced = **{d['reproduced']}**")
+          print(f"device `{d['device_info'].get('device_name')}`, loaded dtype `{d.get('loaded_dtype')}`, "
+                f"fp32 pooler patch `{d.get('pooler_fp32_patch')}`, versions `{d['versions']}`")
+          if "train_losses" in d:
+              print(f"\ntrain losses: {[round(x, 3) for x in d['train_losses']]}")
+          for r in d["results"]:
+              print(f"\n- {'image' if r['image'] else 'text'}: broken={r['broken']} "
+                    f"first-token logprobs={r['first_token_logprobs']}\n  `{r['output'][:200]!r}`")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repro-${{ matrix.os }}-${{ matrix.case }}
+          path: |
+            report.json
+            repro.log
