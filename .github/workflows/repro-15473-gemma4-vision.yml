@@ -2,91 +2,118 @@ name: repro-15473-gemma4-vision
 
 # Reproduce unslothai/unsloth#15473 on GitHub-hosted Apple Silicon (M1-class) runners:
 # Gemma 4 answering an image prompt with <unused6226> when MLX runs it in float16.
+# "prefix" is unsloth-zoo just before unslothai/unsloth-zoo#2146 (the fp32 pooler fix), "main" is current.
 on:
   push:
     branches: [repro/15473-gemma4-e4b-m1]
     paths:
       - .github/workflows/repro-15473-gemma4-vision.yml
-      - .github/repro/gemma4_vision_nan.py
+      - .github/repro/*.py
   workflow_dispatch:
     inputs:
       model:
-        description: MLX checkpoint
+        description: MLX checkpoint for the end-to-end job
         default: mlx-community/gemma-4-e4b-it-4bit
-      zoo_ref:
-        description: unsloth-zoo git ref
-        default: main
 
 permissions:
   contents: read
 
+env:
+  PREFIX_REF: a8eb7f652f224d2dd06f5956d3c838a7c6f8c772
+  # The hosted VM's paravirtual GPU can time out one large command buffer; smaller buffers change only scheduling.
+  MLX_MAX_OPS_PER_BUFFER: '10'
+  MLX_MAX_MB_PER_BUFFER: '256'
+
 jobs:
-  repro:
-    name: ${{ matrix.os }} / ${{ matrix.case }}
+  # 26B's vision tower and projection only (the full checkpoint does not fit a 7 GB runner):
+  # the overflow lives there, so pre-fix must produce non-finite soft tokens and main must not.
+  tower-26b:
+    name: tower-26b / ${{ matrix.os }} / zoo ${{ matrix.zoo }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, macos-26]
-        case: [base-fp16, base-auto, lora-fp16]
+        zoo: [prefix, main]
         include:
-          - case: base-fp16
-            dtype: float16
-            train_steps: 0
-          - case: base-auto
-            dtype: auto
-            train_steps: 0
-          - case: lora-fp16
-            dtype: float16
-            train_steps: 20
-    env:
-      MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e4b-it-4bit' }}
-      ZOO_REF: ${{ inputs.zoo_ref || 'main' }}
-      # The hosted VM's paravirtual GPU times out one large command buffer (the fp16 cast at load);
-      # smaller buffers change only scheduling, not numerics.
-      MLX_MAX_OPS_PER_BUFFER: '10'
-      MLX_MAX_MB_PER_BUFFER: '256'
+          - zoo: prefix
+            expect: reproduced
+          - zoo: main
+            expect: clean
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-
-      - name: Machine
-        run: |
-          sysctl -n machdep.cpu.brand_string
-          sysctl -n hw.memsize | awk '{print $1/1073741824 " GB"}'
-          sw_vers
-          df -h . | tail -1
-
-      # Same MLX stack the reporters' Unsloth Desktop runs (see the issue thread).
       - name: Install
         run: |
-          python -m pip install --upgrade pip
-          for attempt in 1 2 3; do
-            pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@${ZOO_REF}" && break
-            [ "$attempt" -eq 3 ] && exit 1
-            sleep $((5 * attempt))
-          done
-          # mlx-vlm 0.7.9 declares a newer transformers, but Desktop runs it on 5.5.0: pin both without the resolver.
-          pip install --no-deps 'mlx==0.32.4' 'mlx-vlm==0.7.9' 'mlx-lm==0.32.2' 'transformers==5.5.0' 'tokenizers==0.22.2'
-          python -c "import mlx_lm, mlx_vlm, transformers; print('imports ok')"
-          pip list | grep -iE '^(mlx|transformers|unsloth)'
+          ref=main; [ "${{ matrix.zoo }}" = prefix ] && ref="$PREFIX_REF"
+          bash .github/repro/install.sh "$ref"
+      - name: Vision tower in fp16
+        run: |
+          set -o pipefail
+          python -u .github/repro/gemma4_vision_tower_fp16.py \
+            --model mlx-community/gemma-4-26b-a4b-it-4bit --expect "${{ matrix.expect }}" \
+            --report report.json 2>&1 | tee repro.log
+      - name: Summary
+        if: always()
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          if not os.path.exists("report.json"):
+              print("no report"); raise SystemExit
+          d = json.load(open("report.json"))
+          f16 = d["mlx.core.float16"]
+          print(f"### tower-26b / ${{ matrix.os }} / zoo ${{ matrix.zoo }}: reproduced = **{d['reproduced']}** "
+                f"(expected ${{ matrix.expect }})")
+          print(f"unsloth-zoo {d['unsloth_zoo']}, fix applied {d['pooler_fix_applied']}, device `{d['device']}`")
+          print(f"\nfp16 tower non-finite {f16['tower']['nonfinite']}, soft-token non-finite "
+                f"{f16['soft_tokens']['nonfinite']}, cosine vs fp32 {f16.get('cosine_vs_fp32')}")
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tower-26b-${{ matrix.os }}-${{ matrix.zoo }}
+          path: |
+            report.json
+            repro.log
 
+  # Whole model, text and image prompts, as Unsloth Studio loads it. Only macos-26 gets through the
+  # fp16 cast at load; macos-15 and the LoRA case hit the VM's GPU timeout there.
+  e2e:
+    name: e2e / macos-26 / ${{ matrix.case }} / zoo ${{ matrix.zoo }}
+    runs-on: macos-26
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {case: base-fp16, dtype: float16, zoo: prefix}
+          - {case: base-fp16, dtype: float16, zoo: main}
+          - {case: base-auto, dtype: auto, zoo: main}
+    env:
+      MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e4b-it-4bit' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install
+        run: |
+          ref=main; [ "${{ matrix.zoo }}" = prefix ] && ref="$PREFIX_REF"
+          bash .github/repro/install.sh "$ref"
       - name: Download model
         run: python -c "from huggingface_hub import snapshot_download; print(snapshot_download('${MODEL}'))"
-
       - name: Reproduce
         run: |
           set -o pipefail
           python -u .github/repro/gemma4_vision_nan.py \
-            --model "$MODEL" --dtype "${{ matrix.dtype }}" \
-            --train-steps "${{ matrix.train_steps }}" --report report.json 2>&1 | tee repro.log
-
+            --model "$MODEL" --dtype "${{ matrix.dtype }}" --report report.json 2>&1 | tee repro.log
       - name: Summary
         if: always()
         run: |
@@ -95,20 +122,17 @@ jobs:
           if not os.path.exists("report.json"):
               print("no report (script failed before writing it)"); raise SystemExit
           d = json.load(open("report.json"))
-          print(f"### ${{ matrix.os }} / ${{ matrix.case }}: reproduced = **{d['reproduced']}**")
+          print(f"### e2e / ${{ matrix.case }} / zoo ${{ matrix.zoo }}: reproduced = **{d['reproduced']}**")
           print(f"device `{d['device_info'].get('device_name')}`, loaded dtype `{d.get('loaded_dtype')}`, "
                 f"fp32 pooler patch `{d.get('pooler_fp32_patch')}`, versions `{d['versions']}`")
-          if "train_losses" in d:
-              print(f"\ntrain losses: {[round(x, 3) for x in d['train_losses']]}")
           for r in d["results"]:
               print(f"\n- {'image' if r['image'] else 'text'}: broken={r['broken']} "
                     f"first-token logprobs={r['first_token_logprobs']}\n  `{r['output'][:200]!r}`")
           EOF
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: repro-${{ matrix.os }}-${{ matrix.case }}
+          name: e2e-${{ matrix.case }}-${{ matrix.zoo }}
           path: |
             report.json
             repro.log
