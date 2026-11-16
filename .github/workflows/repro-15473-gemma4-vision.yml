@@ -43,6 +43,10 @@ jobs:
     env:
       MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e4b-it-4bit' }}
       ZOO_REF: ${{ inputs.zoo_ref || 'main' }}
+      # The hosted VM's paravirtual GPU times out one large command buffer (the fp16 cast at load);
+      # smaller buffers change only scheduling, not numerics.
+      MLX_MAX_OPS_PER_BUFFER: '10'
+      MLX_MAX_MB_PER_BUFFER: '256'
     steps:
       - uses: actions/checkout@v4
         with:
